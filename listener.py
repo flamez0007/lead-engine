@@ -19,31 +19,36 @@ JETSTREAM_URL = "wss://jetstream1.us-east.bsky.network/subscribe?wantedCollectio
 AFTERCHOICE_WEBHOOK = "https://discord.com/api/webhooks/1528859955212451880/7eqlB5irt32mFz-q534hZS7N8J0wMG9lf4bCYiEqGFtwvhdLdbRiA4usgpeycXhS9Oo4"
 DECO_WEBHOOK = "https://discord.com/api/webhooks/1528870135731851396/PORbJqM0VsXIUfsmKBXRQ3TUCti1uopo7uKzs-IG1WcRFIHrZEDsuXC_ZC5Qtiiiz3bC"
 
-# Groq Cloud API setup (Secure Environment Variable)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # =====================================================================
-# TIER 1 SIGNAL GROUPS (Combinatorial Matcher)
+# TIER 1 SIGNAL GROUPS (Tightened to Protect Groq Rate Limits)
 # =====================================================================
-SITUATION_SIGNALS = [
-    "launching", "starting", "building", "expanding", "growing", 
-    "rebranding", "relaunching", "redesigning", "rebuilding", "pivoting", "revamping"
+# Hard drop words: instantly discard before calling AI
+NEGATIVE_NOISE = [
+    "hiring", "job opening", "apply now", "remote manager", "full-time", "part-time",
+    "salary", "resume", "giveaway", "free download", "trump", "biden", "election",
+    "porn", "nsfw", "onlyfans", "dating", "ngl.link"
 ]
 
-NEED_PAIN_SIGNALS = [
-    "need", "looking for", "searching for", "help", "recommend", "recommendation", 
-    "struggling", "frustrated", "broken", "outdated", "slow", "failed", "ghosted", 
-    "ugly", "embarrassing", "botched", "fired", "conversion dropped"
+# Targeted Afterchoice phrases
+HIGH_INTENT_AFTERCHOICE_PHRASES = [
+    "looking for agency", "recommend an agency", "need a developer", "need a designer",
+    "need a web dev", "looking for web dev", "looking for a designer", "fired our agency",
+    "rebrand our", "redesign our", "rebuilding our site", "rebuilding our website",
+    "new landing page", "website isn't converting", "site isn't converting",
+    "redesigning our website", "shopify developer", "nextjs developer"
 ]
 
-BUSINESS_SIGNALS = [
-    "business", "company", "startup", "brand", "store", "product", 
-    "app", "saas", "ecommerce", "e-com", "agency", "platform", "website", 
-    "site", "landing page", "checkout"
-]
+SITUATION_SIGNALS = ["launching", "rebranding", "relaunching", "redesigning", "rebuilding", "pivoting", "revamping"]
+PAIN_SIGNALS = ["broken", "outdated", "failed", "conversion dropped", "amateurish", "frustrated with our website"]
+BUSINESS_SIGNALS = ["startup", "brand", "agency", "ecommerce", "saas", "our website", "our store"]
 
-DECO_KEYWORDS = ["wall art", "decor", "apartment", "bare walls", "living room", "interior design"]
+DECO_PHRASES = [
+    "bare walls", "empty walls", "wall art", "textured art", "interior design ideas",
+    "looking for art", "decorating my apartment", "decorating our living room"
+]
 
 # =====================================================================
 # TIER 2 SYSTEM PROMPT SPECIFICATION
@@ -129,22 +134,24 @@ def mark_as_processed(post_uri: str):
 # TIER 1 FILTER
 # =====================================================================
 def passes_tier1_filter(clean_text: str) -> tuple[bool, str]:
-    if any(keyword in clean_text for keyword in DECO_KEYWORDS):
+    # 1. Hard noise discard
+    if any(noise in clean_text for noise in NEGATIVE_NOISE):
+        return False, ""
+
+    # 2. Check Deco signals
+    if any(phrase in clean_text for phrase in DECO_PHRASES):
         return True, "DECO"
 
-    has_situation = any(s in clean_text for s in SITUATION_SIGNALS)
-    has_pain = any(p in clean_text for p in NEED_PAIN_SIGNALS)
-    has_business = any(b in clean_text for b in BUSINESS_SIGNALS)
+    # 3. Check High-Intent Direct Phrases for Afterchoice
+    if any(phrase in clean_text for phrase in HIGH_INTENT_AFTERCHOICE_PHRASES):
+        return True, "AFTERCHOICE"
 
-    is_afterchoice_candidate = (
-        (has_situation and has_pain) or
-        (has_pain and has_business) or
-        ("looking for agency" in clean_text) or
-        ("recommend an agency" in clean_text) or
-        ("fired our agency" in clean_text)
-    )
+    # 4. Strict Combinations (Must have Situation + Pain + Business)
+    has_sit = any(s in clean_text for s in SITUATION_SIGNALS)
+    has_pain = any(p in clean_text for p in PAIN_SIGNALS)
+    has_biz = any(b in clean_text for b in BUSINESS_SIGNALS)
 
-    if is_afterchoice_candidate:
+    if (has_sit and has_pain) or (has_pain and has_biz):
         return True, "AFTERCHOICE"
 
     return False, ""
@@ -199,8 +206,7 @@ async def evaluate_intent_with_groq_api(post_text: str, venture: str) -> tuple[d
             )
             verdict = "YES" in res.choices[0].message.content.upper()
             return {}, {"qualified": verdict, "total_score": 100 if verdict else 0, "status": "QUALIFIED" if verdict else "REJECTED"}
-        except Exception as err:
-            logging.error(f"⚠️ DECO Groq error: {err}")
+        except Exception:
             return {}, {"qualified": False, "status": "REJECTED"}
 
     try:
@@ -217,8 +223,9 @@ async def evaluate_intent_with_groq_api(post_text: str, venture: str) -> tuple[d
         qual_result = evaluate_lead_qualification(eval_data)
         return eval_data, qual_result
     except Exception as ai_err:
-        logging.error(f"⚠️ Groq API Inference error: {ai_err}")
-        return {}, {"qualified": False, "status": "ERROR", "reason": str(ai_err)}
+        # Handles 400 safety refusals or rate limits smoothly
+        logging.info(f"Skipping unprocessable or throttled post: {ai_err}")
+        return {}, {"qualified": False, "status": "SKIPPED", "reason": str(ai_err)}
 
 # =====================================================================
 # DISCORD DISPATCHER
