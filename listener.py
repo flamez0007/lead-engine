@@ -19,7 +19,7 @@ JETSTREAM_URL = "wss://jetstream1.us-east.bsky.network/subscribe?wantedCollectio
 AFTERCHOICE_WEBHOOK = "https://discord.com/api/webhooks/1528859955212451880/7eqlB5irt32mFz-q534hZS7N8J0wMG9lf4bCYiEqGFtwvhdLdbRiA4usgpeycXhS9Oo4"
 DECO_WEBHOOK = "https://discord.com/api/webhooks/1528870135731851396/PORbJqM0VsXIUfsmKBXRQ3TUCti1uopo7uKzs-IG1WcRFIHrZEDsuXC_ZC5Qtiiiz3bC"
 
-# Groq Cloud API setup (Free Tier - Meta Llama 3.1)
+# Groq Cloud API setup (Secure Environment Variable)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
@@ -194,7 +194,7 @@ async def evaluate_intent_with_groq_api(post_text: str, venture: str) -> tuple[d
     if venture == "DECO":
         try:
             res = await groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="openai/gpt-oss-20b",
                 messages=[{"role": "user", "content": f"Does this post show someone looking for wall art, decor, or redecorating? Answer YES or NO. Post: {post_text}"}]
             )
             verdict = "YES" in res.choices[0].message.content.upper()
@@ -205,7 +205,7 @@ async def evaluate_intent_with_groq_api(post_text: str, venture: str) -> tuple[d
 
     try:
         response = await groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="openai/gpt-oss-20b",
             messages=[
                 {"role": "system", "content": EVALUATOR_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Analyze this post: \"{post_text}\""}
