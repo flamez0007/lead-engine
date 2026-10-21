@@ -25,20 +25,18 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 # =====================================================================
 # TIER 1 SIGNAL GROUPS (Tightened to Protect Groq Rate Limits)
 # =====================================================================
-# Hard drop words: instantly discard before calling AI
 NEGATIVE_NOISE = [
     "hiring", "job opening", "apply now", "remote manager", "full-time", "part-time",
     "salary", "resume", "giveaway", "free download", "trump", "biden", "election",
     "porn", "nsfw", "onlyfans", "dating", "ngl.link"
 ]
 
-# Targeted Afterchoice phrases
 HIGH_INTENT_AFTERCHOICE_PHRASES = [
     "looking for agency", "recommend an agency", "need a developer", "need a designer",
     "need a web dev", "looking for web dev", "looking for a designer", "fired our agency",
     "rebrand our", "redesign our", "rebuilding our site", "rebuilding our website",
     "new landing page", "website isn't converting", "site isn't converting",
-    "redesigning our website", "shopify developer", "nextjs developer"
+    "redesigning our website", "shopify developer", "nextjs developer", "agency recommendation"
 ]
 
 SITUATION_SIGNALS = ["launching", "rebranding", "relaunching", "redesigning", "rebuilding", "pivoting", "revamping"]
@@ -69,13 +67,13 @@ DISQUALIFICATION PROFILES (Set is_disqualified to true if ANY match):
 - Author is discussing a consumer experience without owning the business or decision.
 
 SCORING VECTORS (Score each 0 to 5):
-1. meaningful_gap: Real friction/transition between Current and Desired state? (GATING VECTOR)
-2. actionability: Evidence of near-term intent or active search? (GATING VECTOR)
-3. service_match: Maps directly to branding, web dev, UI/UX, or e-commerce rebuilds? (GATING VECTOR)
-4. business_context: Real business, startup, or commercial project? (MULTIPLIER VECTOR)
-5. authority: Likely a decision-maker (founder, CEO, owner)? (MULTIPLIER VECTOR)
+1. meaningful_gap: Real friction/transition between Current and Desired state? (GATING VECTOR: Score 3+ if site is outdated, failing to convert, or blocking launch)
+2. actionability: Evidence of near-term intent or active search? (GATING VECTOR: Score 4-5 if explicitly asking for agency recommendations or developers)
+3. service_match: Maps directly to branding, web dev, UI/UX, or e-commerce rebuilds? (GATING VECTOR: Score 4-5 for website redesigns, development, or agency sourcing)
+4. business_context: Real business, startup, or commercial project? (MULTIPLIER VECTOR: Score 3-5 for B2B, startups, companies)
+5. authority: Likely a decision-maker (founder, CEO, owner)? (MULTIPLIER VECTOR: Score 3-5 if speaking on behalf of company/project)
 
-Respond ONLY with valid JSON:
+Respond ONLY with valid JSON matching this schema:
 {
   "is_disqualified": boolean,
   "disqualification_reason": "string or null",
@@ -104,7 +102,7 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_posts (
             post_uri TEXT PRIMARY KEY,
-            processed_at TIMESTAMP
+            processed_at TEXT
         )
     """)
     conn.commit()
@@ -122,8 +120,9 @@ def mark_as_processed(post_uri: str):
     conn = sqlite3.connect("processed_leads.db")
     cursor = conn.cursor()
     try:
+        # Uses ISO 8601 string format to prevent Python 3.12 SQLite adapter warning
         cursor.execute("INSERT INTO processed_posts (post_uri, processed_at) VALUES (?, ?)", 
-                       (post_uri, datetime.now()))
+                       (post_uri, datetime.now().isoformat()))
         conn.commit()
     except sqlite3.IntegrityError:
         pass
@@ -134,19 +133,15 @@ def mark_as_processed(post_uri: str):
 # TIER 1 FILTER
 # =====================================================================
 def passes_tier1_filter(clean_text: str) -> tuple[bool, str]:
-    # 1. Hard noise discard
     if any(noise in clean_text for noise in NEGATIVE_NOISE):
         return False, ""
 
-    # 2. Check Deco signals
     if any(phrase in clean_text for phrase in DECO_PHRASES):
         return True, "DECO"
 
-    # 3. Check High-Intent Direct Phrases for Afterchoice
     if any(phrase in clean_text for phrase in HIGH_INTENT_AFTERCHOICE_PHRASES):
         return True, "AFTERCHOICE"
 
-    # 4. Strict Combinations (Must have Situation + Pain + Business)
     has_sit = any(s in clean_text for s in SITUATION_SIGNALS)
     has_pain = any(p in clean_text for p in PAIN_SIGNALS)
     has_biz = any(b in clean_text for b in BUSINESS_SIGNALS)
@@ -182,7 +177,8 @@ def evaluate_lead_qualification(eval_data: dict) -> dict:
         return {
             "qualified": False,
             "status": "REJECTED (Gating Failure)",
-            "reason": f"Failed gate(s): {', '.join(failed_gates)}"
+            "reason": f"Failed gate(s): {', '.join(failed_gates)}",
+            "scores": scores
         }
     
     gating_score = ((gap + act + match) / 15.0) * 70.0
@@ -194,7 +190,8 @@ def evaluate_lead_qualification(eval_data: dict) -> dict:
         "qualified": is_qualified,
         "status": "QUALIFIED" if is_qualified else "REJECTED (Low Score)",
         "total_score": total_score,
-        "reason": f"Final Weighted Score: {total_score}/100"
+        "reason": f"Final Weighted Score: {total_score}/100",
+        "scores": scores
     }
 
 async def evaluate_intent_with_groq_api(post_text: str, venture: str) -> tuple[dict, dict]:
@@ -221,9 +218,13 @@ async def evaluate_intent_with_groq_api(post_text: str, venture: str) -> tuple[d
         raw_json = response.choices[0].message.content
         eval_data = json.loads(raw_json)
         qual_result = evaluate_lead_qualification(eval_data)
+        
+        # Transparent logging of all vector scores
+        scores = eval_data.get("scores", {})
+        logging.info(f"AI Scores -> Gap: {scores.get('meaningful_gap')}/5 | Act: {scores.get('actionability')}/5 | Match: {scores.get('service_match')}/5 | Biz: {scores.get('business_context')}/5 | Auth: {scores.get('authority')}/5 | Status: {qual_result.get('status')}")
+        
         return eval_data, qual_result
     except Exception as ai_err:
-        # Handles 400 safety refusals or rate limits smoothly
         logging.info(f"Skipping unprocessable or throttled post: {ai_err}")
         return {}, {"qualified": False, "status": "SKIPPED", "reason": str(ai_err)}
 
@@ -307,7 +308,7 @@ async def stream_bluesky_firehose():
                                     send_discord_webhook(target_webhook, assigned_venture, post_text, user_did, post_uri, eval_data, qual_result)
                                 )
                             else:
-                                logging.info(f"Dropped post [{qual_result.get('status')}]: '{post_text[:35]}...'")
+                                logging.info(f"Dropped post [{qual_result.get('status')}]: '{post_text[:60]}...' | Reason: {qual_result.get('reason')}")
                                 
                 except json.JSONDecodeError:
                     continue
